@@ -1,6 +1,4 @@
-import argparse
 import json
-import math
 import random
 from pathlib import Path
 
@@ -15,109 +13,6 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
 
-class PairDataset(Dataset):
-    def __init__(self, samples, transform=None, pairs_per_epoch=4000, seed=42):
-        self.samples = samples
-        self.transform = transform
-        self.pairs_per_epoch = pairs_per_epoch
-        self.seed = seed
-        self.class_to_paths = {}
-        for path, label in samples:
-            self.class_to_paths.setdefault(label, []).append(path)
-        self.labels = sorted(self.class_to_paths.keys())
-        self.rng = random.Random(seed)
-
-    def __len__(self):
-        return self.pairs_per_epoch
-
-    def _make_pair(self, idx):
-        same = idx % 2 == 0
-        if same:
-            label = self.rng.choice(self.labels)
-            p1, p2 = self.rng.sample(self.class_to_paths[label], 2)
-            target = 1.0
-        else:
-            l1, l2 = self.rng.sample(self.labels, 2)
-            p1 = self.rng.choice(self.class_to_paths[l1])
-            p2 = self.rng.choice(self.class_to_paths[l2])
-            target = 0.0
-        return p1, p2, target
-
-    def __getitem__(self, idx):
-        p1, p2, target = self._make_pair(idx)
-        img1 = Image.open(p1).convert('L')
-        img2 = Image.open(p2).convert('L')
-        if self.transform is not None:
-            img1 = self.transform(img1)
-            img2 = self.transform(img2)
-        return img1, img2, torch.tensor([target], dtype=torch.float32), str(p1), str(p2)
-
-
-class SingleImageDataset(Dataset):
-    def __init__(self, samples, transform=None):
-        self.samples = samples
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        path, label = self.samples[idx]
-        img = Image.open(path).convert('L')
-        if self.transform is not None:
-            img = self.transform(img)
-        return img, label, str(path)
-
-
-class SiameseEncoder(nn.Module):
-    def __init__(self, embedding_dim=64):
-        super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(1, 32, 3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, 3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),
-            nn.Conv2d(64, 128, 3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),
-        )
-        self.head = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(128 * 14 * 11, 256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.2),
-            nn.Linear(256, embedding_dim),
-        )
-
-    def forward_once(self, x):
-        x = self.features(x)
-        x = self.head(x)
-        x = F.normalize(x, p=2, dim=1)
-        return x
-
-    def forward(self, x1, x2):
-        z1 = self.forward_once(x1)
-        z2 = self.forward_once(x2)
-        return z1, z2
-
-
-class ContrastiveLoss(nn.Module):
-    def __init__(self, margin=1.0):
-        super().__init__()
-        self.margin = margin
-
-    def forward(self, z1, z2, target):
-        target = target.view(-1)
-        distance = F.pairwise_distance(z1, z2)
-        loss = target * distance.pow(2) + (1.0 - target) * torch.clamp(self.margin - distance, min=0.0).pow(2)
-        return loss.mean(), distance
-
-
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -125,257 +20,231 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
 
 
-def discover_samples(data_dir):
+def read_samples(data_dir):
     data_dir = Path(data_dir)
     if not data_dir.exists():
-        raise FileNotFoundError(f'Каталог с датасетом не найден: {data_dir}')
-    samples = []
-    class_dirs = sorted([p for p in data_dir.iterdir() if p.is_dir() and p.name.startswith('s')], key=lambda p: int(p.name[1:]))
-    for class_dir in class_dirs:
-        label = int(class_dir.name[1:]) - 1
-        images = sorted(list(class_dir.glob('*.pgm')) + list(class_dir.glob('*.png')) + list(class_dir.glob('*.jpg')))
-        for img_path in images:
-            samples.append((img_path, label))
+        raise FileNotFoundError(f'Каталог не найден: {data_dir}')
+    samples = {}
+    for d in sorted([x for x in data_dir.iterdir() if x.is_dir() and x.name.startswith('s')], key=lambda x: int(x.name[1:])):
+        label = int(d.name[1:]) - 1
+        imgs = sorted(sum([list(d.glob(ext)) for ext in ('*.pgm', '*.png', '*.jpg', '*.jpeg')], []))
+        if imgs:
+            samples[label] = imgs
     if not samples:
-        raise RuntimeError(f'В каталоге {data_dir} не найдены изображения')
-    return samples
+        raise RuntimeError('Изображения не найдены')
+    train, test = [], []
+    for label, imgs in samples.items():
+        train += [(p, label) for p in imgs[:8]]
+        test += [(p, label) for p in imgs[8:]]
+    return train, test
 
 
-def split_samples(samples, train_per_class=8):
-    by_class = {}
-    for path, label in samples:
-        by_class.setdefault(label, []).append(path)
-    train_samples = []
-    test_samples = []
-    for label, paths in sorted(by_class.items()):
-        paths = sorted(paths)
-        train_paths = paths[:train_per_class]
-        test_paths = paths[train_per_class:]
-        train_samples.extend([(p, label) for p in train_paths])
-        test_samples.extend([(p, label) for p in test_paths])
-    return train_samples, test_samples
+class FacePairs(Dataset):
+    def __init__(self, samples, tfm, size, seed=42):
+        self.samples = samples
+        self.tfm = tfm
+        self.size = size
+        self.rng = random.Random(seed)
+        self.by_class = {}
+        for path, label in samples:
+            self.by_class.setdefault(label, []).append(path)
+        self.labels = list(self.by_class)
+
+    def __len__(self):
+        return self.size
+
+    def __getitem__(self, i):
+        same = i % 2 == 0
+        if same:
+            label = self.rng.choice(self.labels)
+            p1, p2 = self.rng.sample(self.by_class[label], 2)
+            y = 1.0
+        else:
+            a, b = self.rng.sample(self.labels, 2)
+            p1 = self.rng.choice(self.by_class[a])
+            p2 = self.rng.choice(self.by_class[b])
+            y = 0.0
+        x1 = self.tfm(Image.open(p1).convert('L'))
+        x2 = self.tfm(Image.open(p2).convert('L'))
+        return x1, x2, torch.tensor([y], dtype=torch.float32), str(p1), str(p2)
 
 
-def build_transforms():
-    return transforms.Compose([
-        transforms.Resize((112, 92)),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5,), (0.5,)),
-    ])
+class FaceImages(Dataset):
+    def __init__(self, samples, tfm):
+        self.samples = samples
+        self.tfm = tfm
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, i):
+        path, label = self.samples[i]
+        return self.tfm(Image.open(path).convert('L')), label, str(path)
+
+
+class SiameseNet(nn.Module):
+    def __init__(self, emb_dim=64):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(1, 32, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2)
+        )
+        self.head = nn.Sequential(nn.Flatten(), nn.Linear(128 * 14 * 11, 128), nn.ReLU(), nn.Linear(128, emb_dim))
+
+    def encode(self, x):
+        return F.normalize(self.head(self.features(x)), p=2, dim=1)
+
+    def forward(self, x1, x2):
+        return self.encode(x1), self.encode(x2)
+
+
+class ContrastiveLoss(nn.Module):
+    def __init__(self, margin=1.0):
+        super().__init__()
+        self.margin = margin
+
+    def forward(self, z1, z2, y):
+        d = F.pairwise_distance(z1, z2)
+        y = y.view(-1)
+        return (y * d.pow(2) + (1 - y) * torch.clamp(self.margin - d, min=0).pow(2)).mean(), d
 
 
 @torch.no_grad()
-def collect_pair_metrics(model, loader, device, mode='bce', margin=1.0):
+def evaluate(model, loader, device, mode, margin):
     model.eval()
-    distances = []
-    labels = []
-    probs = []
-    path_pairs = []
-    for x1, x2, target, p1, p2 in loader:
-        x1 = x1.to(device)
-        x2 = x2.to(device)
-        z1, z2 = model(x1, x2)
-        distance = F.pairwise_distance(z1, z2)
-        prob = torch.sigmoid(-distance)
-        distances.extend(distance.cpu().numpy().tolist())
-        probs.extend(prob.cpu().numpy().tolist())
-        labels.extend(target.view(-1).cpu().numpy().tolist())
-        path_pairs.extend(list(zip(p1, p2)))
-    distances = np.array(distances)
-    probs = np.array(probs)
-    labels = np.array(labels)
-    if mode == 'bce':
-        preds = (probs >= 0.5).astype(np.float32)
-    else:
-        preds = (distances < margin / 2.0).astype(np.float32)
-    acc = float((preds == labels).mean())
-    same_dist = float(distances[labels == 1].mean()) if np.any(labels == 1) else math.nan
-    diff_dist = float(distances[labels == 0].mean()) if np.any(labels == 0) else math.nan
+    dists, labels, pairs = [], [], []
+    for x1, x2, y, p1, p2 in loader:
+        z1, z2 = model(x1.to(device), x2.to(device))
+        d = F.pairwise_distance(z1, z2).cpu().numpy()
+        dists.extend(d.tolist())
+        labels.extend(y.view(-1).numpy().tolist())
+        pairs.extend(list(zip(p1, p2)))
+    dists, labels = np.array(dists), np.array(labels)
+    preds = (torch.sigmoid(torch.tensor(-dists)).numpy() >= 0.5).astype(np.float32) if mode == 'bce' else (dists < margin / 2).astype(np.float32)
     return {
-        'accuracy': acc,
-        'same_distance_mean': same_dist,
-        'diff_distance_mean': diff_dist,
-        'distances': distances,
+        'accuracy': float((preds == labels).mean()),
+        'same_distance_mean': float(dists[labels == 1].mean()),
+        'diff_distance_mean': float(dists[labels == 0].mean()),
+        'dists': dists,
         'labels': labels,
-        'probs': probs,
-        'path_pairs': path_pairs,
+        'pairs': pairs,
     }
 
 
 @torch.no_grad()
-def collect_embeddings(model, loader, device):
+def embed(model, loader, device):
     model.eval()
-    embeddings = []
-    labels = []
-    paths = []
-    for x, label, path in loader:
-        x = x.to(device)
-        z = model.forward_once(x)
-        embeddings.append(z.cpu().numpy())
-        labels.extend(label.numpy().tolist())
-        paths.extend(path)
-    return np.concatenate(embeddings, axis=0), np.array(labels), paths
+    feats, labels = [], []
+    for x, y, _ in loader:
+        feats.append(model.encode(x.to(device)).cpu().numpy())
+        labels.extend(y.numpy().tolist())
+    return np.concatenate(feats), np.array(labels)
 
 
-@torch.no_grad()
-def select_demo_pairs(model, loader, device, count=6):
-    model.eval()
-    same_examples = []
-    diff_examples = []
-    for x1, x2, target, p1, p2 in loader:
-        x1 = x1.to(device)
-        x2 = x2.to(device)
+def train_epoch(model, loader, opt, device, mode, margin):
+    model.train()
+    bce = nn.BCELoss()
+    contrast = ContrastiveLoss(margin)
+    total = 0
+    for x1, x2, y, _, _ in loader:
+        x1, x2, y = x1.to(device), x2.to(device), y.to(device)
         z1, z2 = model(x1, x2)
-        distance = F.pairwise_distance(z1, z2).cpu().numpy()
-        target_np = target.view(-1).cpu().numpy()
-        for i in range(len(distance)):
-            item = (p1[i], p2[i], float(distance[i]), int(target_np[i]))
-            if item[3] == 1 and len(same_examples) < count // 2:
-                same_examples.append(item)
-            if item[3] == 0 and len(diff_examples) < count - count // 2:
-                diff_examples.append(item)
-        if len(same_examples) + len(diff_examples) >= count:
-            break
-    return same_examples + diff_examples
+        d = F.pairwise_distance(z1, z2).unsqueeze(1)
+        loss = bce(torch.sigmoid(-d), y) if mode == 'bce' else contrast(z1, z2, y)[0]
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        total += loss.item() * len(x1)
+    return total / len(loader.dataset)
 
 
-def plot_tsne(embeddings, labels, out_path, title):
-    perplexity = max(5, min(30, len(embeddings) - 1))
-    tsne = TSNE(n_components=2, random_state=42, init='pca', learning_rate='auto', perplexity=perplexity)
-    pts = tsne.fit_transform(embeddings)
+def plot_tsne(embs, labels, path, title):
+    pts = TSNE(n_components=2, random_state=42, init='pca', learning_rate='auto', perplexity=max(5, min(30, len(embs) - 1))).fit_transform(embs)
     plt.figure(figsize=(10, 8))
-    scatter = plt.scatter(pts[:, 0], pts[:, 1], c=labels, cmap='tab20', s=40)
-    plt.legend(*scatter.legend_elements(num=10), title='Classes', bbox_to_anchor=(1.02, 1), loc='upper left')
+    sc = plt.scatter(pts[:, 0], pts[:, 1], c=labels, cmap='tab20', s=40)
+    plt.legend(*sc.legend_elements(num=10), title='Classes', bbox_to_anchor=(1.02, 1), loc='upper left')
     plt.title(title)
     plt.tight_layout()
-    plt.savefig(out_path, dpi=200)
+    plt.savefig(path, dpi=200)
     plt.close()
 
 
-def plot_inference_grid(examples, out_path, title):
-    rows = len(examples)
-    fig, axes = plt.subplots(rows, 2, figsize=(6, 2.5 * rows))
-    if rows == 1:
-        axes = np.array([axes])
-    for row, (p1, p2, distance, label) in enumerate(examples):
-        img1 = np.array(Image.open(p1).convert('L'))
-        img2 = np.array(Image.open(p2).convert('L'))
-        axes[row, 0].imshow(img1, cmap='gray')
-        axes[row, 1].imshow(img2, cmap='gray')
-        axes[row, 0].set_title(f'label={label}')
-        axes[row, 1].set_title(f'distance={distance:.4f}')
-        axes[row, 0].axis('off')
-        axes[row, 1].axis('off')
+def plot_pairs(info, path, title, n=6):
+    items = []
+    for cls in [1, 0]:
+        for (p1, p2), d, y in zip(info['pairs'], info['dists'], info['labels']):
+            if y == cls:
+                items.append((p1, p2, d, int(y)))
+                if len(items) >= (n // 2 if cls == 1 else n):
+                    break
+    fig, ax = plt.subplots(len(items), 2, figsize=(6, 2.5 * len(items)))
+    if len(items) == 1:
+        ax = np.array([ax])
+    for i, (p1, p2, d, y) in enumerate(items):
+        ax[i, 0].imshow(np.array(Image.open(p1).convert('L')), cmap='gray')
+        ax[i, 1].imshow(np.array(Image.open(p2).convert('L')), cmap='gray')
+        ax[i, 0].set_title(f'label={y}')
+        ax[i, 1].set_title(f'distance={d:.4f}')
+        ax[i, 0].axis('off')
+        ax[i, 1].axis('off')
     fig.suptitle(title)
     plt.tight_layout()
-    plt.savefig(out_path, dpi=200)
+    plt.savefig(path, dpi=200)
     plt.close(fig)
 
 
-def train_one_epoch(model, loader, optimizer, device, criterion_name='bce', contrastive_margin=1.0):
-    model.train()
-    bce_loss = nn.BCELoss()
-    contrastive = ContrastiveLoss(margin=contrastive_margin)
-    total_loss = 0.0
-    total_items = 0
-    for x1, x2, target, _, _ in loader:
-        x1 = x1.to(device)
-        x2 = x2.to(device)
-        target = target.to(device)
-        optimizer.zero_grad()
-        z1, z2 = model(x1, x2)
-        if criterion_name == 'bce':
-            distance = F.pairwise_distance(z1, z2).unsqueeze(1)
-            prob = torch.sigmoid(-distance)
-            loss = bce_loss(prob, target)
-        else:
-            loss, _ = contrastive(z1, z2, target)
-        loss.backward()
-        optimizer.step()
-        bs = x1.size(0)
-        total_loss += loss.item() * bs
-        total_items += bs
-    return total_loss / max(total_items, 1)
-
-
-def run_experiment(name, train_loader, test_pair_loader, test_single_loader, device, epochs, lr, margin, out_dir):
-    model = SiameseEncoder().to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+def run(mode, train_loader, test_pair_loader, test_img_loader, device, epochs, lr, margin, out_dir):
+    model = SiameseNet().to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
     history = []
     for epoch in range(1, epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, optimizer, device, criterion_name=name, contrastive_margin=margin)
-        metrics = collect_pair_metrics(model, test_pair_loader, device, mode=name, margin=margin)
+        loss = train_epoch(model, train_loader, opt, device, mode, margin)
+        info = evaluate(model, test_pair_loader, device, mode, margin)
         history.append({
             'epoch': epoch,
-            'train_loss': train_loss,
-            'test_accuracy': metrics['accuracy'],
-            'same_distance_mean': metrics['same_distance_mean'],
-            'diff_distance_mean': metrics['diff_distance_mean'],
+            'train_loss': loss,
+            'test_accuracy': info['accuracy'],
+            'same_distance_mean': info['same_distance_mean'],
+            'diff_distance_mean': info['diff_distance_mean'],
         })
-        print(f'[{name}] epoch {epoch}/{epochs} loss={train_loss:.4f} test_acc={metrics["accuracy"]:.4f} same_dist={metrics["same_distance_mean"]:.4f} diff_dist={metrics["diff_distance_mean"]:.4f}')
-    final_metrics = collect_pair_metrics(model, test_pair_loader, device, mode=name, margin=margin)
-    embeddings, labels, _ = collect_embeddings(model, test_single_loader, device)
-    plot_tsne(embeddings, labels, out_dir / f'tsne_{name}.png', f't-SNE ({name})')
-    examples = select_demo_pairs(model, test_pair_loader, device, count=6)
-    plot_inference_grid(examples, out_dir / f'inference_{name}.png', f'Inference ({name})')
-    return model, history, final_metrics
+        print(f'[{mode}] epoch {epoch}/{epochs} loss={loss:.4f} acc={info["accuracy"]:.4f} same={info["same_distance_mean"]:.4f} diff={info["diff_distance_mean"]:.4f}')
+    info = evaluate(model, test_pair_loader, device, mode, margin)
+    embs, labels = embed(model, test_img_loader, device)
+    plot_tsne(embs, labels, out_dir / f'tsne_{mode}.png', f't-SNE ({mode})')
+    plot_pairs(info, out_dir / f'inference_{mode}.png', f'Inference ({mode})')
+    return history, info
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--data-dir', type=str, default='att_faces')
-    parser.add_argument('--output-dir', type=str, default='outputs')
-    parser.add_argument('--epochs', type=int, default=5)
-    parser.add_argument('--batch-size', type=int, default=32)
-    parser.add_argument('--pairs-train', type=int, default=4000)
-    parser.add_argument('--pairs-test', type=int, default=800)
-    parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--margin', type=float, default=1.0)
-    parser.add_argument('--seed', type=int, default=42)
-    args = parser.parse_args()
+    epochs = 15
+    batch_size = 32
+    lr = 1e-3
+    margin = 1.0
+    seed = 42
 
-    set_seed(args.seed)
+    set_seed(seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    out_dir = Path(args.output_dir)
+    out_dir = Path('outputs')
     out_dir.mkdir(parents=True, exist_ok=True)
+    tfm = transforms.Compose([transforms.Resize((112, 92)), transforms.ToTensor(), transforms.Normalize((0.5,), (0.5,))])
+    train, test = read_samples('att_faces')
+    train_loader = DataLoader(FacePairs(train, tfm, 4000, seed), batch_size=batch_size, shuffle=True)
+    test_pair_loader = DataLoader(FacePairs(test, tfm, 800, seed + 1), batch_size=batch_size)
+    test_img_loader = DataLoader(FaceImages(test, tfm), batch_size=batch_size)
 
-    samples = discover_samples(args.data_dir)
-    train_samples, test_samples = split_samples(samples, train_per_class=8)
-    transform = build_transforms()
-
-    train_pair_dataset = PairDataset(train_samples, transform=transform, pairs_per_epoch=args.pairs_train, seed=args.seed)
-    test_pair_dataset = PairDataset(test_samples, transform=transform, pairs_per_epoch=args.pairs_test, seed=args.seed + 1)
-    test_single_dataset = SingleImageDataset(test_samples, transform=transform)
-
-    train_loader = DataLoader(train_pair_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
-    test_pair_loader = DataLoader(test_pair_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
-    test_single_loader = DataLoader(test_single_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
-
-    _, history_bce, metrics_bce = run_experiment('bce', train_loader, test_pair_loader, test_single_loader, device, args.epochs, args.lr, args.margin, out_dir)
-    _, history_contrastive, metrics_contrastive = run_experiment('contrastive', train_loader, test_pair_loader, test_single_loader, device, args.epochs, args.lr, args.margin, out_dir)
+    hist_bce, info_bce = run('bce', train_loader, test_pair_loader, test_img_loader, device, epochs, lr, margin, out_dir)
+    hist_con, info_con = run('contrastive', train_loader, test_pair_loader, test_img_loader, device, epochs, lr, margin, out_dir)
 
     summary = {
         'device': str(device),
-        'train_samples': len(train_samples),
-        'test_samples': len(test_samples),
-        'bce': {
-            'history': history_bce,
-            'final_accuracy': metrics_bce['accuracy'],
-            'same_distance_mean': metrics_bce['same_distance_mean'],
-            'diff_distance_mean': metrics_bce['diff_distance_mean'],
-        },
-        'contrastive': {
-            'history': history_contrastive,
-            'final_accuracy': metrics_contrastive['accuracy'],
-            'same_distance_mean': metrics_contrastive['same_distance_mean'],
-            'diff_distance_mean': metrics_contrastive['diff_distance_mean'],
-        },
+        'train_samples': len(train),
+        'test_samples': len(test),
+        'bce': {'history': hist_bce, 'final_accuracy': info_bce['accuracy'], 'same_distance_mean': info_bce['same_distance_mean'], 'diff_distance_mean': info_bce['diff_distance_mean']},
+        'contrastive': {'history': hist_con, 'final_accuracy': info_con['accuracy'], 'same_distance_mean': info_con['same_distance_mean'], 'diff_distance_mean': info_con['diff_distance_mean']},
     }
-
     with open(out_dir / 'summary.json', 'w', encoding='utf-8') as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
-
-    print('\nГотово. Сохранены файлы:')
     for path in sorted(out_dir.iterdir()):
         print(path)
 
