@@ -1,4 +1,3 @@
-import json
 import random
 from pathlib import Path
 
@@ -235,18 +234,6 @@ def main():
 
     hist_bce, info_bce = run('bce', train_loader, test_pair_loader, test_img_loader, device, epochs, lr, margin, out_dir)
     hist_con, info_con = run('contrastive', train_loader, test_pair_loader, test_img_loader, device, epochs, lr, margin, out_dir)
-
-    summary = {
-        'device': str(device),
-        'train_samples': len(train),
-        'test_samples': len(test),
-        'bce': {'history': hist_bce, 'final_accuracy': info_bce['accuracy'], 'same_distance_mean': info_bce['same_distance_mean'], 'diff_distance_mean': info_bce['diff_distance_mean']},
-        'contrastive': {'history': hist_con, 'final_accuracy': info_con['accuracy'], 'same_distance_mean': info_con['same_distance_mean'], 'diff_distance_mean': info_con['diff_distance_mean']},
-    }
-    with open(out_dir / 'summary.json', 'w', encoding='utf-8') as f:
-        json.dump(summary, f, ensure_ascii=False, indent=2)
-    for path in sorted(out_dir.iterdir()):
-        print(path)
 
 
 if __name__ == '__main__':
