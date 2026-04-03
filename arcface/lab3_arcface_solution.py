@@ -18,17 +18,15 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms, models
 from pytorch_metric_learning import losses
 
+try:
+    import certifi
+except ImportError:
+    certifi = None
 
-SEED = 42
-DATASET_CANDIDATES = (
-    Path("./EuroSAT"),
-    Path("./EuroSAT/2750"),
-    Path("./EuroSAT_RGB"),
-    Path("./data/EuroSAT"),
-    Path("./data/EuroSAT/2750"),
-    Path("./data/EuroSAT_RGB"),
-)
+
+IMAGE_ROOT = Path("./EuroSAT_RGB")
 MODEL_PATH = Path("./best_arcface_eurosat.pt")
+PLOTS_DIR = Path("./plots")
 
 BATCH_SIZE = 128
 NUM_WORKERS = 2
@@ -43,28 +41,27 @@ IMAGE_SIZE = 96
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def set_seed(seed: int = 42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+def configure_ssl():
+    if certifi is None:
+        return
+    ssl._create_default_https_context = lambda: ssl.create_default_context(cafile=certifi.where())
 
 
 def resolve_image_root():
-    for candidate in DATASET_CANDIDATES:
-        if candidate.is_dir() and any(child.is_dir() for child in candidate.iterdir()):
-            return candidate
-
-    candidates = ", ".join(str(path) for path in DATASET_CANDIDATES)
-    raise FileNotFoundError(
-        "Не найдена папка с изображениями EuroSAT. "
-        f"Ожидалась одна из директорий: {candidates}"
-    )
+    if IMAGE_ROOT.is_dir() and any(child.is_dir() for child in IMAGE_ROOT.iterdir()):
+        return IMAGE_ROOT
+    raise FileNotFoundError(f"Не найдена папка с изображениями: {IMAGE_ROOT}")
 
 
-def build_file_splits(image_root: Path, test_size=0.2, val_size=0.1, seed=42):
+def save_plot(filename: str):
+    PLOTS_DIR.mkdir(exist_ok=True)
+    output_path = PLOTS_DIR / filename
+    plt.savefig(output_path, dpi=200, bbox_inches="tight")
+    plt.close()
+    print(f"График сохранен: {output_path.resolve()}")
+
+
+def build_file_splits(image_root: Path, test_size=0.2, val_size=0.1):
     class_names = sorted([p.name for p in image_root.iterdir() if p.is_dir()])
     class_to_idx = {cls_name: i for i, cls_name in enumerate(class_names)}
 
@@ -78,7 +75,6 @@ def build_file_splits(image_root: Path, test_size=0.2, val_size=0.1, seed=42):
         all_paths,
         all_labels,
         test_size=test_size,
-        random_state=seed,
         stratify=all_labels,
     )
 
@@ -86,7 +82,6 @@ def build_file_splits(image_root: Path, test_size=0.2, val_size=0.1, seed=42):
         train_paths,
         train_labels,
         test_size=val_size,
-        random_state=seed,
         stratify=train_labels,
     )
 
@@ -114,7 +109,7 @@ class EuroSATPathsDataset(Dataset):
         image = Image.open(path).convert("RGB")
         if self.transform is not None:
             image = self.transform(image)
-        return image, label, str(path)
+        return image, label
 
 
 class EmbeddingNet(nn.Module):
@@ -155,7 +150,7 @@ def run_epoch(model, loader, loss_func, model_optimizer, loss_optimizer=None, tr
     total_correct = 0
     total_count = 0
 
-    for images, labels, _ in loader:
+    for images, labels in loader:
         images = images.to(DEVICE)
         labels = labels.to(DEVICE)
 
@@ -184,26 +179,25 @@ def run_epoch(model, loader, loss_func, model_optimizer, loss_optimizer=None, tr
 @torch.no_grad()
 def extract_embeddings(model, loader):
     model.eval()
-    all_embeddings, all_labels, all_paths, all_preds = [], [], [], []
+    all_embeddings, all_labels = [], []
 
-    for images, labels, paths in loader:
+    for images, labels in loader:
         images = images.to(DEVICE)
         labels = labels.to(DEVICE)
         embeddings = model(images)
         all_embeddings.append(embeddings.cpu())
         all_labels.append(labels.cpu())
-        all_paths.extend(paths)
 
     all_embeddings = torch.cat(all_embeddings, dim=0)
     all_labels = torch.cat(all_labels, dim=0)
-    return all_embeddings, all_labels, all_paths
+    return all_embeddings, all_labels
 
 
 @torch.no_grad()
 def predict_classes(model, loss_func, loader):
     model.eval()
     y_true, y_pred = [], []
-    for images, labels, _ in loader:
+    for images, labels in loader:
         images = images.to(DEVICE)
         embeddings = model(images)
         logits = loss_func.get_logits(embeddings)
@@ -224,7 +218,7 @@ def plot_history(history):
     plt.title("История обучения")
     plt.legend()
     plt.grid(True)
-    plt.show()
+    save_plot("history_loss.png")
 
     plt.figure(figsize=(10, 4))
     plt.plot(epochs, history["train_acc"], label="train_acc")
@@ -234,7 +228,7 @@ def plot_history(history):
     plt.title("Точность классификации через ArcFace logits")
     plt.legend()
     plt.grid(True)
-    plt.show()
+    save_plot("history_accuracy.png")
 
 
 def plot_tsne(embeddings, labels, class_names, sample_size=3000):
@@ -243,7 +237,7 @@ def plot_tsne(embeddings, labels, class_names, sample_size=3000):
         embeddings = embeddings[idx]
         labels = labels[idx]
 
-    tsne = TSNE(n_components=2, perplexity=30, init="pca", learning_rate="auto", random_state=SEED)
+    tsne = TSNE(n_components=2, perplexity=30, init="pca", learning_rate="auto")
     emb_2d = tsne.fit_transform(embeddings)
 
     plt.figure(figsize=(12, 10))
@@ -254,7 +248,7 @@ def plot_tsne(embeddings, labels, class_names, sample_size=3000):
     plt.title("t-SNE по embedding'ам тестового датасета")
     plt.legend(markerscale=2, bbox_to_anchor=(1.05, 1), loc="upper left")
     plt.tight_layout()
-    plt.show()
+    save_plot("tsne_test_embeddings.png")
 
 
 @torch.no_grad()
@@ -262,7 +256,7 @@ def visualize_pairs(model, dataset, num_same=3, num_diff=3):
     model.eval()
 
     groups = defaultdict(list)
-    for idx, (_, label, _) in enumerate(dataset):
+    for idx, (_, label) in enumerate(dataset):
         groups[label].append(idx)
 
     def get_embedding(img_tensor):
@@ -288,8 +282,8 @@ def visualize_pairs(model, dataset, num_same=3, num_diff=3):
 
     plt.figure(figsize=(10, 3 * len(pairs)))
     for row, (i1, i2, pair_type) in enumerate(pairs, start=1):
-        img1, label1, path1 = dataset[i1]
-        img2, label2, path2 = dataset[i2]
+        img1, label1 = dataset[i1]
+        img2, label2 = dataset[i2]
 
         emb1 = get_embedding(img1)
         emb2 = get_embedding(img2)
@@ -311,16 +305,16 @@ def visualize_pairs(model, dataset, num_same=3, num_diff=3):
         plt.title(f"label={label2}\ncosine distance={dist:.4f}")
 
     plt.tight_layout()
-    plt.show()
+    save_plot("sample_pairs.png")
 
 
 def main():
-    set_seed(SEED)
+    configure_ssl()
     print("Device:", DEVICE)
 
     image_root = resolve_image_root()
     print("Датасет:", image_root.resolve())
-    splits = build_file_splits(image_root, test_size=TEST_SIZE, val_size=VAL_SIZE, seed=SEED)
+    splits = build_file_splits(image_root, test_size=TEST_SIZE, val_size=VAL_SIZE)
     class_names = splits["class_names"]
     num_classes = len(class_names)
     print("Классы:", class_names)
@@ -402,7 +396,7 @@ def main():
     print("\nClassification report на test:")
     print(classification_report(y_true, y_pred, target_names=class_names, digits=4))
 
-    test_embeddings, test_labels, _ = extract_embeddings(model, test_loader)
+    test_embeddings, test_labels = extract_embeddings(model, test_loader)
     plot_tsne(test_embeddings.numpy(), test_labels.numpy(), class_names, sample_size=3000)
 
     visualize_pairs(model, test_dataset, num_same=3, num_diff=3)
